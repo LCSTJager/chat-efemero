@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>chat_efêmero</title>
+<style>
+  :root{
+    --bg: #0b0906;
+    --bg-raised: #14100a;
+    --amber: #ffb000;
+    --amber-dim: #8a5f00;
+    --amber-faint: #4a3a1a;
+    --red: #ff4433;
+    --font-mono: ui-monospace, "Cascadia Code", "JetBrains Mono", "IBM Plex Mono", "SF Mono", "Courier New", monospace;
+  }
+  *{ box-sizing: border-box; }
+  html,body{
+    margin:0; padding:0; height:100%;
+    background: var(--bg);
+    color: var(--amber);
+    font-family: var(--font-mono);
+    overflow: hidden;
+  }
+  #app{
+    display:flex; flex-direction:column;
+    height:100dvh; width:100vw;
+    position:relative;
+  }
+  /* subtle CRT texture — restrained, not the whole show */
+  #app::before{
+    content:"";
+    position:absolute; inset:0;
+    pointer-events:none;
+    background: repeating-linear-gradient(
+      to bottom, rgba(255,176,0,0.025) 0px, rgba(255,176,0,0.025) 1px,
+      transparent 1px, transparent 3px
+    );
+    mix-blend-mode: overlay;
+  }
+  #titlebar{
+    flex: 0 0 auto;
+    display:flex; align-items:center; gap:.6em;
+    padding:.6em 1em;
+    border-bottom:1px solid var(--amber-faint);
+    font-size:.85em;
+    color: var(--amber-dim);
+    letter-spacing:.02em;
+    white-space:nowrap;
+    overflow-x:auto;
+  }
+  #titlebar .brand{ color:var(--amber); font-weight:600; }
+  #titlebar .sep{ color:var(--amber-faint); }
+  #roomcode{ color:var(--amber); cursor:pointer; text-decoration: underline dotted var(--amber-faint); }
+  #status{ margin-left:auto; padding-left:1em; }
+  #status.ok{ color:#5eff8f; }
+  #status.warn{ color:var(--red); }
+  #screen{
+    flex: 1 1 auto;
+    overflow-y:auto;
+    padding:1em;
+    font-size: clamp(13px, 2vw, 15px);
+    line-height:1.55;
+  }
+  #screen .line{ white-space:pre-wrap; word-break:break-word; margin-bottom:.15em; }
+  .l-sys{ color: var(--amber-dim); }
+  .l-err{ color: var(--red); }
+  .l-self{ color: #eee; }
+  .l-self .tag{ color: var(--amber); }
+  .l-peer{ color: var(--amber); }
+  .l-peer .tag{ color: #5eff8f; }
+  #inputline{
+    flex:0 0 auto;
+    display:flex; align-items:center; gap:.5em;
+    padding:.7em 1em calc(.7em + env(safe-area-inset-bottom));
+    border-top:1px solid var(--amber-faint);
+  }
+  #inputline .prompt{ color:#5eff8f; }
+  #msginput{
+    flex:1; background:transparent; border:none; outline:none;
+    color:var(--amber); font-family:inherit; font-size:1em; caret-color:transparent;
+  }
+  #msginput::placeholder{ color: var(--amber-faint); }
+  .cursor{
+    width:.55em; height:1.1em; background:var(--amber);
+    animation: blink 1s step-end infinite;
+    flex-shrink:0;
+  }
+  @keyframes blink{ 50%{ opacity:0; } }
+  #panicBtn{
+    position:absolute; right:.8em; bottom: calc(3.4em + env(safe-area-inset-bottom));
+    width:1.4em; height:1.4em;
+    background:transparent; border:1px solid var(--amber-faint);
+    color: var(--amber-faint);
+    cursor:pointer; font-family:inherit; font-size:.9em; line-height:1;
+    border-radius:2px;
+    opacity:.55;
+    transition: opacity .15s, border-color .15s, color .15s;
+  }
+  #panicBtn:hover{ opacity:1; border-color:var(--amber); color:var(--amber); }
+  #panicOverlay{
+    position:fixed; inset:0; background:#fff;
+    display:none; cursor:default;
+    z-index:999;
+  }
+  #panicOverlay.on{ display:block; }
+  @media (prefers-reduced-motion: reduce){
+    .cursor{ animation:none; }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="titlebar">
+    <span class="brand">chat_efêmero</span>
+    <span class="sep">·</span>
+    <span>sala: <span id="roomcode">—</span></span>
+    <span id="status" class="warn">iniciando…</span>
+  </div>
+  <div id="screen"><div id="log"></div></div>
+  <div id="inputline">
+    <span class="prompt">&gt;</span>
+    <input id="msginput" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="" disabled>
+    <span class="cursor"></span>
+  </div>
+  <button id="panicBtn" title="ocultar tudo">▢</button>
+</div>
+<div id="panicOverlay"></div>
+
+<script>
+// ---- CONFIG -----------------------------------------------------------
+// depois de publicar o server/ (server.js + package.json) em algum host
+// (Render, Railway…), troca essa URL pela do seu serviço.
+const SIGNAL_URL = 'https://chat-efemero.onrender.com';
+
+// TURN server — necessário quando um dos lados está atrás de NAT restritivo
+// (rede de operadora, corporativa, etc). Crie uma conta grátis em
+// metered.ca → Dashboard → copie o array de ICE servers → cole aqui.
+const TURN_URLS = [
+  'turn:global.relay.metered.ca:80',
+  'turn:global.relay.metered.ca:443',
+  'turn:global.relay.metered.ca:443?transport=tcp'
+];
+const TURN_USERNAME = 'SEU-USERNAME-METERED';
+const TURN_CREDENTIAL = 'SEU-CREDENTIAL-METERED';
+// -------------------------------------------------------------------
+
+const $ = (sel) => document.querySelector(sel);
+const logEl = $('#log');
+const screenEl = $('#screen');
+const statusEl = $('#status');
+const roomEl = $('#roomcode');
+const input = $('#msginput');
+const panicBtn = $('#panicBtn');
+const panicOverlay = $('#panicOverlay');
+
+let ws, pc, dc, role;
+const originalTitle = document.title;
+
+function line(text, cls){
+  const div = document.createElement('div');
+  div.className = 'line ' + cls;
+  div.textContent = text;
+  logEl.appendChild(div);
+  screenEl.scrollTop = screenEl.scrollHeight;
+}
+function sys(text){ line('[sistema] ' + text, 'l-sys'); }
+function err(text){ line('[erro] ' + text, 'l-err'); }
+function self(text){ line('você> ' + text, 'l-self'); }
+function peerMsg(text){ line('peer> ' + text, 'l-peer'); }
+function setStatus(text, ok){
+  statusEl.textContent = text;
+  statusEl.className = ok ? 'ok' : 'warn';
+}
+
+async function typeBoot(lines){
+  for(const l of lines){
+    sys(l);
+    await new Promise(r => setTimeout(r, 220));
+  }
+}
+
+function roomCodeFromHash(){
+  const h = location.hash.replace('#','').trim();
+  if (h) return h;
+  const code = Math.random().toString(36).slice(2,8);
+  location.hash = code;
+  return code;
+}
+
+function setupPeerConnection(){
+  const iceServers = [
+    { urls: 'stun:stun.l.google.com:19302' }
+  ];
+
+  if (!TURN_USERNAME.includes('SEU-') && !TURN_CREDENTIAL.includes('SEU-')) {
+    iceServers.push({
+      urls: TURN_URLS,
+      username: TURN_USERNAME,
+      credential: TURN_CREDENTIAL
+    });
+  } else {
+    sys('aviso: credenciais TURN não configuradas — conexões atrás de NAT restritivo podem falhar.');
+  }
+
+  pc = new RTCPeerConnection({ iceServers, iceCandidatePoolSize: 10 });
+  pc.onicecandidate = (e) => {
+    if (e.candidate) ws.send(JSON.stringify({ type:'ice', candidate:e.candidate }));
+  };
+  pc.ondatachannel = (e) => { dc = e.channel; setupDataChannel(dc); };
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected'){
+      setStatus('conexão perdida', false);
+    }
+  };
+}
+
+function setupDataChannel(channel){
+  channel.onopen = () => {
+    setStatus('conectado', true);
+    input.disabled = false;
+    input.placeholder = 'digite e pressione enter';
+    input.focus();
+    sys('canal direto estabelecido. nada disso fica salvo em lugar nenhum.');
+  };
+  channel.onmessage = (e) => peerMsg(e.data);
+  channel.onclose = () => {
+    setStatus('peer saiu', false);
+    input.disabled = true;
+    sys('a outra ponta desconectou. a sessão acabou aqui.');
+  };
+}
+
+async function main(){
+  const room = roomCodeFromHash();
+  roomEl.textContent = room;
+  roomEl.title = 'clique para copiar o link';
+  roomEl.onclick = () => {
+    navigator.clipboard?.writeText(location.href).then(() => sys('link copiado.'));
+  };
+
+  await typeBoot([
+    'inicializando terminal…',
+    'sala: ' + room,
+    'compartilhe este link com a outra pessoa: ' + location.href,
+    'conectando ao relay de sinalização…'
+  ]);
+
+  if (SIGNAL_URL.includes('SEU-SERVIDOR-AQUI')) {
+    err('SIGNAL_URL não configurada. edite a constante no topo do arquivo depois de publicar o server/.');
+    setStatus('não configurado', false);
+    return;
+  }
+
+  ws = new WebSocket(SIGNAL_URL + '?room=' + encodeURIComponent(room));
+
+  ws.onerror = () => { err('não foi possível falar com o relay de sinalização.'); setStatus('erro de conexão', false); };
+  ws.onclose = () => { if (!dc || dc.readyState !== 'open') setStatus('desconectado', false); };
+
+  ws.onmessage = async (event) => {
+    const msg = JSON.parse(event.data);
+
+    if (msg.type === 'role') {
+      role = msg.role;
+      sys(role === 'host' ? 'aguardando a outra pessoa entrar…' : 'entrando na sala…');
+    }
+
+    else if (msg.type === 'room-full') {
+      err('essa sala já tem duas pessoas.');
+      setStatus('sala cheia', false);
+      ws.close();
+    }
+
+    else if (msg.type === 'ready') {
+      sys('peer encontrado. negociando conexão direta…');
+      setupPeerConnection();
+      if (role === 'host') {
+        dc = pc.createDataChannel('chat');
+        setupDataChannel(dc);
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        ws.send(JSON.stringify({ type:'offer', sdp: offer }));
+      }
+    }
+
+    else if (msg.type === 'offer') {
+      if (!pc) setupPeerConnection();
+      await pc.setRemoteDescription(msg.sdp);
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      ws.send(JSON.stringify({ type:'answer', sdp: answer }));
+    }
+
+    else if (msg.type === 'answer') {
+      await pc.setRemoteDescription(msg.sdp);
+    }
+
+    else if (msg.type === 'ice') {
+      try { await pc.addIceCandidate(msg.candidate); } catch(e) {}
+    }
+
+    else if (msg.type === 'peer-left') {
+      setStatus('peer saiu', false);
+      input.disabled = true;
+      sys('a outra ponta desconectou. a sessão acabou aqui.');
+    }
+  };
+}
+
+input.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && input.value.trim()){
+    const text = input.value;
+    if (dc && dc.readyState === 'open'){
+      dc.send(text);
+      self(text);
+      input.value = '';
+    } else {
+      err('canal ainda não está pronto.');
+    }
+  }
+});
+
+// ---- botão de pânico ----------------------------------------------
+function panicOn(){
+  panicOverlay.classList.add('on');
+  document.title = 'about:blank';
+}
+function panicOff(){
+  panicOverlay.classList.remove('on');
+  document.title = originalTitle;
+}
+panicBtn.addEventListener('click', panicOn);
+panicOverlay.addEventListener('click', panicOff);
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && panicOverlay.classList.contains('on')) panicOff();
+});
+
+main();
+</script>
+</body>
+</html>
