@@ -1,0 +1,16 @@
+{
+  "name": "chat-efemero-signal",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Relay de sinalizacao WebRTC para o chat efemero (nao guarda mensagens, so intermedia a conexao P2P)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
