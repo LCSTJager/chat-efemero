@@ -123,19 +123,16 @@
     <input id="msginput" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="" disabled>
     <span class="cursor"></span>
   </div>
-  <button id="panicBtn" title="ocultar tudo">▢</button>
+  <button id="panicBtn" title="ocultar tudo (/blank)">▢</button>
 </div>
 <div id="panicOverlay"></div>
 
 <script>
 // ---- CONFIG -----------------------------------------------------------
-// depois de publicar o server/ (server.js + package.json) em algum host
-// (Render, Railway…), troca essa URL pela do seu serviço.
 const SIGNAL_URL = 'https://chat-efemero.onrender.com';
 
 // TURN server — necessário quando um dos lados está atrás de NAT restritivo
-// (rede de operadora, corporativa, etc). Crie uma conta grátis em
-// metered.ca → Dashboard → copie o array de ICE servers → cole aqui.
+// (rede de operadora, corporativa, etc).
 const TURN_URLS = [
   'turn:global.relay.metered.ca:80',
   'turn:global.relay.metered.ca:443',
@@ -155,8 +152,11 @@ const panicBtn = $('#panicBtn');
 const panicOverlay = $('#panicOverlay');
 
 let ws, pc, dc, role;
+let peerNick = null;
+let sessionActive = false;
 const originalTitle = document.title;
 
+// ---- linhas do terminal ------------------------------------------------
 function line(text, cls){
   const div = document.createElement('div');
   div.className = 'line ' + cls;
@@ -166,8 +166,21 @@ function line(text, cls){
 }
 function sys(text){ line('[sistema] ' + text, 'l-sys'); }
 function err(text){ line('[erro] ' + text, 'l-err'); }
-function self(text){ line('você> ' + text, 'l-self'); }
-function peerMsg(text){ line('peer> ' + text, 'l-peer'); }
+
+function taggedLine(tag, text, cls){
+  const div = document.createElement('div');
+  div.className = 'line ' + cls;
+  const tagSpan = document.createElement('span');
+  tagSpan.className = 'tag';
+  tagSpan.textContent = tag + '> ';
+  div.appendChild(tagSpan);
+  div.appendChild(document.createTextNode(text));
+  logEl.appendChild(div);
+  screenEl.scrollTop = screenEl.scrollHeight;
+}
+function self(text){ taggedLine('você', text, 'l-self'); }
+function peerMsg(text){ taggedLine(peerNick || 'peer', text, 'l-peer'); }
+
 function setStatus(text, ok){
   statusEl.textContent = text;
   statusEl.className = ok ? 'ok' : 'warn';
@@ -180,12 +193,58 @@ async function typeBoot(lines){
   }
 }
 
+// ---- apelido randômico ---------------------------------------------
+const NICK_ADJ = ['sombra','eco','fantasma','ruido','sinal','vento','brasa','ceu','onda','cifra','ponto','vetor','raio','nevoa','deriva'];
+const NICK_NOUN = ['zero','lobo','corvo','falcao','lince','node','pulso','bit','ronin','nomade','viajante','operador','satelite','cipher'];
+function generateNickname(){
+  const a = NICK_ADJ[Math.floor(Math.random()*NICK_ADJ.length)];
+  const n = NICK_NOUN[Math.floor(Math.random()*NICK_NOUN.length)];
+  const num = Math.floor(Math.random()*90+10);
+  return `${a}_${n}${num}`;
+}
+const selfNick = generateNickname();
+
+// ---- temas -----------------------------------------------------------
+const THEMES = {
+  ambar:     { bg:'#0b0906', bgRaised:'#14100a', fg:'#ffb000', dim:'#8a5f00', faint:'#4a3a1a', red:'#ff4433' },
+  matrix:    { bg:'#050805', bgRaised:'#0a120a', fg:'#00ff66', dim:'#0a8f3a', faint:'#123a1c', red:'#ff5555' },
+  azul:      { bg:'#060a10', bgRaised:'#0c141e', fg:'#33d4ff', dim:'#1a6f8a', faint:'#173040', red:'#ff5566' },
+  vermelho:  { bg:'#0a0505', bgRaised:'#150a0a', fg:'#ff4d4d', dim:'#8a2020', faint:'#3a1414', red:'#ff8800' },
+  mono:      { bg:'#0a0a0a', bgRaised:'#141414', fg:'#e6e6e6', dim:'#888888', faint:'#333333', red:'#ff5555' }
+};
+function setThemeVars(t){
+  const root = document.documentElement.style;
+  root.setProperty('--bg', t.bg);
+  root.setProperty('--bg-raised', t.bgRaised);
+  root.setProperty('--amber', t.fg);
+  root.setProperty('--amber-dim', t.dim);
+  root.setProperty('--amber-faint', t.faint);
+  root.setProperty('--red', t.red);
+}
+function applyTheme(name, announce){
+  const t = THEMES[name];
+  if (!t){ if (announce) err('tema desconhecido. use: ' + Object.keys(THEMES).join(', ')); return; }
+  setThemeVars(t);
+  try{ localStorage.setItem('chatEfemeroTheme', name); }catch(e){}
+  if (announce) sys('tema alterado: ' + name);
+}
+(function loadSavedTheme(){
+  try{
+    const saved = localStorage.getItem('chatEfemeroTheme');
+    if (saved && THEMES[saved]) setThemeVars(THEMES[saved]);
+  }catch(e){}
+})();
+
+// ---- sala: sempre nova a cada carregamento --------------------------
+// se veio um link com #codigo, usamos esse código pra entrar como convidado,
+// mas limpamos a barra de endereço na hora — assim um F5 depois nunca
+// reabre a mesma sala, sempre gera uma sala nova.
 function roomCodeFromHash(){
   const h = location.hash.replace('#','').trim();
-  if (h) return h;
-  const code = Math.random().toString(36).slice(2,8);
-  location.hash = code;
-  return code;
+  const code = h || Math.random().toString(36).slice(2,8);
+  const shareLink = location.origin + location.pathname + location.search + '#' + code;
+  history.replaceState(null, '', location.pathname + location.search);
+  return { code, shareLink };
 }
 
 function setupPeerConnection(){
@@ -217,32 +276,62 @@ function setupPeerConnection(){
 
 function setupDataChannel(channel){
   channel.onopen = () => {
+    sessionActive = true;
     setStatus('conectado', true);
     input.disabled = false;
-    input.placeholder = 'digite e pressione enter';
+    input.placeholder = 'digite e pressione enter (/help para comandos)';
     input.focus();
     sys('canal direto estabelecido. nada disso fica salvo em lugar nenhum.');
+    sys('seu apelido nesta sessão: ' + selfNick);
+    try{ channel.send(JSON.stringify({ type:'hello', nick: selfNick })); }catch(e){}
   };
-  channel.onmessage = (e) => peerMsg(e.data);
+  channel.onmessage = (e) => {
+    let msg;
+    try{ msg = JSON.parse(e.data); }catch(parseErr){ return; }
+    if (msg.type === 'hello') {
+      peerNick = msg.nick || 'peer';
+      sys('a outra ponta se identificou como ' + peerNick);
+    } else if (msg.type === 'msg') {
+      peerMsg(msg.text);
+    } else if (msg.type === 'nuke') {
+      wipeChat('a outra pessoa destruiu a sessão (/nuke). tudo apagado por aqui também.');
+    }
+  };
   channel.onclose = () => {
-    setStatus('peer saiu', false);
-    input.disabled = true;
-    sys('a outra ponta desconectou. a sessão acabou aqui.');
+    wipeChat('a outra ponta desconectou. a sessão foi apagada dos dois lados.');
   };
 }
 
+// ---- destruição total da sessão -------------------------------------
+function wipeChat(reason){
+  if (!sessionActive && !dc && !pc && !ws) return; // já estava limpo
+  sessionActive = false;
+  try{ dc && dc.close(); }catch(e){}
+  try{ pc && pc.close(); }catch(e){}
+  try{ ws && ws.close(); }catch(e){}
+  dc = null; pc = null; ws = null; peerNick = null;
+  logEl.innerHTML = '';
+  input.value = '';
+  input.disabled = true;
+  input.placeholder = '';
+  setStatus('sessão encerrada', false);
+  sys(reason || 'sessão encerrada.');
+  sys('recarregue a página para abrir uma sala nova.');
+}
+
 async function main(){
-  const room = roomCodeFromHash();
+  const { code: room, shareLink } = roomCodeFromHash();
   roomEl.textContent = room;
   roomEl.title = 'clique para copiar o link';
   roomEl.onclick = () => {
-    navigator.clipboard?.writeText(location.href).then(() => sys('link copiado.'));
+    navigator.clipboard?.writeText(shareLink).then(() => sys('link copiado.'));
   };
 
   await typeBoot([
     'inicializando terminal…',
     'sala: ' + room,
-    'compartilhe este link com a outra pessoa: ' + location.href,
+    'compartilhe este link com a outra pessoa: ' + shareLink,
+    'comandos: /blank  /panic  /nuke  /theme <nome>  /help',
     'conectando ao relay de sinalização…'
   ]);
 
@@ -300,27 +389,90 @@ async function main(){
     }
 
     else if (msg.type === 'peer-left') {
-      setStatus('peer saiu', false);
-      input.disabled = true;
-      sys('a outra ponta desconectou. a sessão acabou aqui.');
+      wipeChat('a outra ponta desconectou. a sessão foi apagada dos dois lados.');
     }
   };
 }
 
+// ---- comandos ---------------------------------------------------------
+const HELP_TEXT = [
+  'comandos disponíveis:',
+  '/blank — esconde a tela numa página em branco (esc para voltar)',
+  '/panic — destrói a conexão e leva você para uma página aleatória da wikipédia',
+  '/nuke — apaga o chat nos dois lados imediatamente',
+  '/theme <nome> — muda o tema: ' + Object.keys(THEMES).join(', '),
+  '/help — mostra esta ajuda'
+];
+
+function handleCommand(raw){
+  const parts = raw.trim().split(/\s+/);
+  const cmd = parts[0].toLowerCase();
+  const arg = parts.slice(1).join(' ');
+  switch(cmd){
+    case '/blank':
+      panicOn();
+      break;
+    case '/panic':
+      doFullPanic();
+      break;
+    case '/nuke':
+      doNuke();
+      break;
+    case '/theme':
+      if (!arg) sys('temas disponíveis: ' + Object.keys(THEMES).join(', '));
+      else applyTheme(arg.toLowerCase(), true);
+      break;
+    case '/help':
+      HELP_TEXT.forEach(l => sys(l));
+      break;
+    default:
+      err('comando desconhecido: ' + cmd + ' (tente /help)');
+  }
+}
+
+function doNuke(){
+  try{
+    if (dc && dc.readyState === 'open') dc.send(JSON.stringify({ type:'nuke' }));
+  }catch(e){}
+  wipeChat('você destruiu a sessão (/nuke). tudo apagado por aqui.');
+}
+
+function doFullPanic(){
+  try{ dc && dc.close(); }catch(e){}
+  try{ pc && pc.close(); }catch(e){}
+  try{ ws && ws.close(); }catch(e){}
+  const randomPages = [
+    'https://pt.wikipedia.org/wiki/Especial:Aleat%C3%B3ria',
+    'https://en.wikipedia.org/wiki/Special:Random'
+  ];
+  const target = randomPages[Math.floor(Math.random()*randomPages.length)];
+  window.location.replace(target);
+}
+
 input.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && input.value.trim()){
-    const text = input.value;
+    const raw = input.value;
+    input.value = '';
+    if (raw.trim().startsWith('/')) {
+      handleCommand(raw);
+      return;
+    }
     if (dc && dc.readyState === 'open'){
-      dc.send(text);
-      self(text);
-      input.value = '';
+      dc.send(JSON.stringify({ type:'msg', text: raw }));
+      self(raw);
     } else {
       err('canal ainda não está pronto.');
     }
   }
 });
 
-// ---- botão de pânico ----------------------------------------------
+// ---- confirmação antes de recarregar/fechar --------------------------
+window.addEventListener('beforeunload', (e) => {
+  e.preventDefault();
+  e.returnValue = '';
+});
+
+// ---- botão de pânico (equivalente a /blank) ---------------------------
 function panicOn(){
   panicOverlay.classList.add('on');
   document.title = 'about:blank';
